@@ -1,0 +1,591 @@
+
+/* =============================================================================
+   LEAVE MANAGEMENT SYSTEM - SCHEMA CREATION SCRIPT
+   Target: Microsoft SQL Server 2019 or later
+   Keys:   INT IDENTITY
+
+   READ THIS FIRST - three columns were added that are not on your diagram:
+     1. LeaveTransaction.LeaveYear   - without it you cannot write the balance query
+     2. LeaveRequest.LeaveYear       - so pending hours match the same year
+     3. LeaveTransaction.CreatedById / CreatedOn - audit trail for manual adjustments
+
+   Run order matters. Tables are created first without foreign keys, then the
+   keys are added at the end. This is because Employee and Department reference
+   each other, so neither can be created "second".
+   ============================================================================= */
+
+
+/* =============================================================================
+   SECTION 0 - DATABASE
+   ============================================================================= */
+
+IF DB_ID('LeaveManagement') IS NULL
+    CREATE DATABASE LeaveManagement;
+GO
+
+USE LeaveManagement;
+GO
+
+
+/* =============================================================================
+   SECTION 1 - DROP EVERYTHING (development only)
+
+   Keep this while you are still changing the design. DELETE this whole section
+   before you use the script anywhere that holds real data.
+   Drop order is the reverse of create order.
+   ============================================================================= */
+
+IF OBJECT_ID('dbo.vw_EmployeeLeaveBalance', 'V')  IS NOT NULL DROP VIEW  dbo.vw_EmployeeLeaveBalance;
+IF OBJECT_ID('dbo.LeaveTransaction', 'U')         IS NOT NULL DROP TABLE dbo.LeaveTransaction;
+IF OBJECT_ID('dbo.LeaveRequest', 'U')             IS NOT NULL DROP TABLE dbo.LeaveRequest;
+IF OBJECT_ID('dbo.UserRole', 'U')                 IS NOT NULL DROP TABLE dbo.UserRole;
+IF OBJECT_ID('dbo.Role', 'U')                     IS NOT NULL DROP TABLE dbo.Role;
+IF OBJECT_ID('dbo.AppUser', 'U')                  IS NOT NULL DROP TABLE dbo.AppUser;
+IF OBJECT_ID('dbo.CompanyHoliday', 'U')           IS NOT NULL DROP TABLE dbo.CompanyHoliday;
+IF OBJECT_ID('dbo.LeaveType', 'U')                IS NOT NULL DROP TABLE dbo.LeaveType;
+IF OBJECT_ID('dbo.Employee', 'U')                 IS NOT NULL DROP TABLE dbo.Employee;
+IF OBJECT_ID('dbo.Department', 'U')               IS NOT NULL DROP TABLE dbo.Department;
+GO
+
+
+/* =============================================================================
+   SECTION 2 - TABLES
+   ============================================================================= */
+
+
+/* -----------------------------------------------------------------------------
+   Department
+   CreatedById / ModifiedById are NULLABLE on purpose. Department references
+   Employee and Employee references Department, so the very first department you
+   insert has no employee to credit yet. Nullable breaks that deadlock.
+   ----------------------------------------------------------------------------- */
+CREATE TABLE dbo.Department
+(
+    DepartmentId    INT             IDENTITY(1,1)   NOT NULL,
+    Name            NVARCHAR(100)                   NOT NULL,
+    Description     NVARCHAR(500)                       NULL,
+    IsActive        BIT                             NOT NULL CONSTRAINT DF_Department_IsActive  DEFAULT (1),
+    CreatedOn       DATETIME2(0)                    NOT NULL CONSTRAINT DF_Department_CreatedOn DEFAULT (SYSUTCDATETIME()),
+    CreatedById     INT                                 NULL,
+    ModifiedOn      DATETIME2(0)                        NULL,
+    ModifiedById    INT                                 NULL,
+
+    CONSTRAINT PK_Department        PRIMARY KEY CLUSTERED (DepartmentId),
+    CONSTRAINT UQ_Department_Name   UNIQUE (Name)
+);
+GO
+
+
+/* -----------------------------------------------------------------------------
+   Employee
+   TerminationDate added: IsActive tells you someone left, but not when, which
+   you need for pro-rating a final entitlement.
+   ----------------------------------------------------------------------------- */
+CREATE TABLE dbo.Employee
+(
+    EmployeeId      INT             IDENTITY(1,1)   NOT NULL,
+    EmployeeNumber  NVARCHAR(20)                    NOT NULL,
+    FirstName       NVARCHAR(100)                   NOT NULL,
+    LastName        NVARCHAR(100)                   NOT NULL,
+    Email           NVARCHAR(256)                   NOT NULL,
+    ManagerId       INT                                 NULL,   -- self-reference; NULL for the top of the tree
+    DepartmentId    INT                             NOT NULL,
+    HireDate        DATE                            NOT NULL,
+    TerminationDate DATE                                NULL,
+    IsActive        BIT                             NOT NULL CONSTRAINT DF_Employee_IsActive  DEFAULT (1),
+    CreatedOn       DATETIME2(0)                    NOT NULL CONSTRAINT DF_Employee_CreatedOn DEFAULT (SYSUTCDATETIME()),
+    CreatedById     INT                                 NULL,
+    ModifiedOn      DATETIME2(0)                        NULL,
+    ModifiedById    INT                                 NULL,
+
+    CONSTRAINT PK_Employee              PRIMARY KEY CLUSTERED (EmployeeId),
+    CONSTRAINT UQ_Employee_Number       UNIQUE (EmployeeNumber),
+    CONSTRAINT UQ_Employee_Email        UNIQUE (Email),
+    CONSTRAINT CK_Employee_NotOwnManager CHECK (ManagerId IS NULL OR ManagerId <> EmployeeId),
+    CONSTRAINT CK_Employee_TermAfterHire CHECK (TerminationDate IS NULL OR TerminationDate >= HireDate)
+);
+GO
+
+
+/* -----------------------------------------------------------------------------
+   LeaveType
+   DefaultAnnualHours is the CURRENT policy value. It is copied onto each
+   allocation transaction when leave is granted, so changing it next year does
+   not silently rewrite what people were given this year.
+   ----------------------------------------------------------------------------- */
+CREATE TABLE dbo.LeaveType
+(
+    LeaveTypeId         INT             IDENTITY(1,1)   NOT NULL,
+    Code                NVARCHAR(20)                    NOT NULL,   -- ANNUAL, SICK, CASUAL...
+    TypeName            NVARCHAR(100)                   NOT NULL,
+    Description         NVARCHAR(500)                       NULL,
+    DefaultAnnualHours  DECIMAL(6,2)                    NOT NULL CONSTRAINT DF_LeaveType_Hours    DEFAULT (0),
+    IsActive            BIT                             NOT NULL CONSTRAINT DF_LeaveType_IsActive DEFAULT (1),
+    CreatedOn           DATETIME2(0)                    NOT NULL CONSTRAINT DF_LeaveType_CreatedOn DEFAULT (SYSUTCDATETIME()),
+    ModifiedOn          DATETIME2(0)                        NULL,
+
+    CONSTRAINT PK_LeaveType         PRIMARY KEY CLUSTERED (LeaveTypeId),
+    CONSTRAINT UQ_LeaveType_Code    UNIQUE (Code),
+    CONSTRAINT UQ_LeaveType_Name    UNIQUE (TypeName),
+    CONSTRAINT CK_LeaveType_Hours   CHECK (DefaultAnnualHours >= 0)
+);
+GO
+
+
+/* -----------------------------------------------------------------------------
+   AppUser  (your "user" table)
+   Renamed because USER is a reserved word in SQL Server. Using it means writing
+   [User] in brackets forever and fighting EF Core over the mapping.
+
+   EmployeeId is UNIQUE: one login per employee.
+   PasswordHash is nullable so SSO-only accounts (ExternalProviderId set) work.
+   ----------------------------------------------------------------------------- */
+CREATE TABLE dbo.AppUser
+(
+    UserId              INT             IDENTITY(1,1)   NOT NULL,
+    EmployeeId          INT                             NOT NULL,
+    UserName            NVARCHAR(100)                   NOT NULL,
+    PasswordHash        NVARCHAR(500)                       NULL,
+    ExternalProviderId  NVARCHAR(200)                       NULL,
+    IsActive            BIT                             NOT NULL CONSTRAINT DF_AppUser_IsActive  DEFAULT (1),
+    LastLoginDate       DATETIME2(0)                        NULL,
+    CreatedOn           DATETIME2(0)                    NOT NULL CONSTRAINT DF_AppUser_CreatedOn DEFAULT (SYSUTCDATETIME()),
+    ModifiedOn          DATETIME2(0)                        NULL,
+
+    CONSTRAINT PK_AppUser               PRIMARY KEY CLUSTERED (UserId),
+    CONSTRAINT UQ_AppUser_UserName      UNIQUE (UserName),
+    CONSTRAINT UQ_AppUser_EmployeeId    UNIQUE (EmployeeId),
+    CONSTRAINT CK_AppUser_HasCredential CHECK (PasswordHash IS NOT NULL OR ExternalProviderId IS NOT NULL)
+);
+GO
+
+
+/* -----------------------------------------------------------------------------
+   Role  (your "Roles" table - singular, to match every other table here)
+   ----------------------------------------------------------------------------- */
+CREATE TABLE dbo.Role
+(
+    RoleId      INT             IDENTITY(1,1)   NOT NULL,
+    Name        NVARCHAR(50)                    NOT NULL,   -- Employee, Manager, HR, Admin
+    Description NVARCHAR(500)                       NULL,
+    IsActive    BIT                             NOT NULL CONSTRAINT DF_Role_IsActive  DEFAULT (1),
+    CreatedOn   DATETIME2(0)                    NOT NULL CONSTRAINT DF_Role_CreatedOn DEFAULT (SYSUTCDATETIME()),
+    ModifiedOn  DATETIME2(0)                        NULL,
+
+    CONSTRAINT PK_Role      PRIMARY KEY CLUSTERED (RoleId),
+    CONSTRAINT UQ_Role_Name UNIQUE (Name)
+);
+GO
+
+
+/* -----------------------------------------------------------------------------
+   UserRole
+   The UNIQUE on (UserId, RoleId) is what stops the same role being granted
+   twice to the same person.
+   ----------------------------------------------------------------------------- */
+CREATE TABLE dbo.UserRole
+(
+    UserRoleId  INT             IDENTITY(1,1)   NOT NULL,
+    UserId      INT                             NOT NULL,
+    RoleId      INT                             NOT NULL,
+    CreatedOn   DATETIME2(0)                    NOT NULL CONSTRAINT DF_UserRole_CreatedOn DEFAULT (SYSUTCDATETIME()),
+    ModifiedOn  DATETIME2(0)                        NULL,
+
+    CONSTRAINT PK_UserRole          PRIMARY KEY CLUSTERED (UserRoleId),
+    CONSTRAINT UQ_UserRole_UserRole UNIQUE (UserId, RoleId)
+);
+GO
+
+
+/* -----------------------------------------------------------------------------
+   CompanyHoliday
+   Year is deliberately absent - it is derivable from HolidayDate.
+   ----------------------------------------------------------------------------- */
+CREATE TABLE dbo.CompanyHoliday
+(
+    HolidayId   INT             IDENTITY(1,1)   NOT NULL,
+    Name        NVARCHAR(100)                   NOT NULL,
+    Description NVARCHAR(500)                       NULL,
+    HolidayDate DATE                            NOT NULL,
+    IsHalfDay   BIT                             NOT NULL CONSTRAINT DF_Holiday_IsHalfDay DEFAULT (0),
+    IsActive    BIT                             NOT NULL CONSTRAINT DF_Holiday_IsActive  DEFAULT (1),
+    CreatedOn   DATETIME2(0)                    NOT NULL CONSTRAINT DF_Holiday_CreatedOn DEFAULT (SYSUTCDATETIME()),
+    ModifiedOn  DATETIME2(0)                        NULL,
+
+    CONSTRAINT PK_CompanyHoliday        PRIMARY KEY CLUSTERED (HolidayId),
+    CONSTRAINT UQ_CompanyHoliday_Date   UNIQUE (HolidayDate)
+);
+GO
+
+
+/* -----------------------------------------------------------------------------
+   LeaveRequest
+
+   Status lifecycle:  Pending -> Approved -> Cancelled
+                      Pending -> Rejected
+                      Pending -> Cancelled   (withdrawn before a decision)
+
+   Hours is always POSITIVE here. The sign lives in LeaveTransaction.
+   LeaveYear added: a request spanning 29 Dec to 3 Jan must state which year's
+   balance it draws from, and your pending calculation filters on it.
+   ----------------------------------------------------------------------------- */
+CREATE TABLE dbo.LeaveRequest
+(
+    RequestId       INT             IDENTITY(1,1)   NOT NULL,
+    EmployeeId      INT                             NOT NULL,
+    LeaveTypeId     INT                             NOT NULL,
+    LeaveYear       SMALLINT                        NOT NULL,
+    StartDate       DATE                            NOT NULL,
+    EndDate         DATE                            NOT NULL,
+    Hours           DECIMAL(6,2)                    NOT NULL,
+    Reason          NVARCHAR(1000)                      NULL,
+    Status          NVARCHAR(20)                    NOT NULL CONSTRAINT DF_LeaveRequest_Status DEFAULT ('Pending'),
+
+    SubmittedOn     DATETIME2(0)                    NOT NULL CONSTRAINT DF_LeaveRequest_SubmittedOn DEFAULT (SYSUTCDATETIME()),
+    SubmittedById   INT                             NOT NULL,   -- usually the employee, but HR can submit for them
+
+    DecisionDate    DATETIME2(0)                        NULL,
+    DecidedById     INT                                 NULL,
+    DecisionComment NVARCHAR(1000)                      NULL,   -- rejection reason lives here
+
+    CancelledOn     DATETIME2(0)                        NULL,
+    CancelledById   INT                                 NULL,
+
+    CONSTRAINT PK_LeaveRequest              PRIMARY KEY CLUSTERED (RequestId),
+    CONSTRAINT CK_LeaveRequest_Status       CHECK (Status IN ('Pending','Approved','Rejected','Cancelled')),
+    CONSTRAINT CK_LeaveRequest_Dates        CHECK (EndDate >= StartDate),
+    CONSTRAINT CK_LeaveRequest_Hours        CHECK (Hours > 0),
+
+    -- A decided request must record who decided and when. A pending one must not.
+    CONSTRAINT CK_LeaveRequest_Decision     CHECK (
+        (Status IN ('Approved','Rejected') AND DecisionDate IS NOT NULL AND DecidedById IS NOT NULL)
+     OR (Status NOT IN ('Approved','Rejected'))
+    ),
+
+    -- A rejection must say why.
+    CONSTRAINT CK_LeaveRequest_RejectReason CHECK (Status <> 'Rejected' OR DecisionComment IS NOT NULL),
+
+    -- A cancelled request must record who cancelled and when.
+    CONSTRAINT CK_LeaveRequest_Cancel       CHECK (
+        (Status = 'Cancelled' AND CancelledOn IS NOT NULL AND CancelledById IS NOT NULL)
+     OR (Status <> 'Cancelled' AND CancelledOn IS NULL AND CancelledById IS NULL)
+    )
+);
+GO
+
+
+/* -----------------------------------------------------------------------------
+   LeaveTransaction  - THE LEDGER
+
+   Append-only. Never UPDATE or DELETE a row here. To correct a mistake, insert
+   an opposing row. Balance = SUM(Hours).
+
+   Hours is SIGNED:
+     positive -> ALLOCATION, ACCRUAL, CARRY_FORWARD, REVERSAL, (some ADJUSTMENT)
+     negative -> DEDUCTION, EXPIRY, (some ADJUSTMENT)
+
+   EffectiveStart / EffectiveEnd define the window in which the hours are valid.
+   An annual allocation runs 01 Jan to 31 Dec. Carry-forward might run 01 Jan to
+   31 Mar, which makes expiry automatic rather than special-cased. Both are NULL
+   for deductions, which simply consume whatever is available.
+   ----------------------------------------------------------------------------- */
+CREATE TABLE dbo.LeaveTransaction
+(
+    TransactionId   INT             IDENTITY(1,1)   NOT NULL,
+    EmployeeId      INT                             NOT NULL,
+    LeaveTypeId     INT                             NOT NULL,
+    LeaveYear       SMALLINT                        NOT NULL,
+    TransactionType NVARCHAR(20)                    NOT NULL,
+    Hours           DECIMAL(6,2)                    NOT NULL,   -- signed
+    LeaveRequestId  INT                                 NULL,   -- set on DEDUCTION and REVERSAL
+    Reason          NVARCHAR(1000)                      NULL,   -- free text, required for ADJUSTMENT
+    TransactionDate DATETIME2(0)                    NOT NULL CONSTRAINT DF_LeaveTxn_TxnDate  DEFAULT (SYSUTCDATETIME()),
+    EffectiveStart  DATE                                NULL,
+    EffectiveEnd    DATE                                NULL,
+    CreatedOn       DATETIME2(0)                    NOT NULL CONSTRAINT DF_LeaveTxn_CreatedOn DEFAULT (SYSUTCDATETIME()),
+    CreatedById     INT                                 NULL,   -- NULL for rows written by the allocation job
+
+    CONSTRAINT PK_LeaveTransaction      PRIMARY KEY CLUSTERED (TransactionId),
+
+    CONSTRAINT CK_LeaveTxn_Type         CHECK (TransactionType IN
+        ('ALLOCATION','ACCRUAL','CARRY_FORWARD','DEDUCTION','REVERSAL','ADJUSTMENT','EXPIRY')),
+
+    -- A zero-hour transaction is meaningless and usually a bug.
+    CONSTRAINT CK_LeaveTxn_NonZero      CHECK (Hours <> 0),
+
+    -- Direction must match the type. This catches a deduction written as +8.
+    CONSTRAINT CK_LeaveTxn_Sign         CHECK (
+        (TransactionType IN ('ALLOCATION','ACCRUAL','CARRY_FORWARD','REVERSAL') AND Hours > 0)
+     OR (TransactionType IN ('DEDUCTION','EXPIRY')                              AND Hours < 0)
+     OR (TransactionType = 'ADJUSTMENT')   -- may go either way
+    ),
+
+    -- A manual adjustment with no explanation is an audit trail that cannot answer anything.
+    CONSTRAINT CK_LeaveTxn_AdjReason    CHECK (TransactionType <> 'ADJUSTMENT' OR Reason IS NOT NULL),
+
+    -- Deductions and reversals must point at the request that caused them.
+    CONSTRAINT CK_LeaveTxn_RequestLink  CHECK (
+        (TransactionType IN ('DEDUCTION','REVERSAL') AND LeaveRequestId IS NOT NULL)
+     OR (TransactionType NOT IN ('DEDUCTION','REVERSAL'))
+    ),
+
+    CONSTRAINT CK_LeaveTxn_EffDates     CHECK (EffectiveEnd IS NULL OR EffectiveStart IS NULL OR EffectiveEnd >= EffectiveStart)
+);
+GO
+
+
+/* =============================================================================
+   SECTION 3 - FOREIGN KEYS
+
+   Every one is NO ACTION (the SQL Server default) rather than CASCADE.
+
+   This is not caution for its own sake. Employee.ManagerId, CreatedById and
+   ModifiedById all point back at Employee, and LeaveRequest is reachable from
+   Employee by several paths. Cascade on any of these produces either
+   "may cause cycles or multiple cascade paths" at create time, or a delete that
+   silently removes somebody's entire leave history. Deactivate with IsActive
+   instead of deleting.
+   ============================================================================= */
+
+ALTER TABLE dbo.Department ADD
+    CONSTRAINT FK_Department_CreatedBy  FOREIGN KEY (CreatedById)  REFERENCES dbo.Employee (EmployeeId),
+    CONSTRAINT FK_Department_ModifiedBy FOREIGN KEY (ModifiedById) REFERENCES dbo.Employee (EmployeeId);
+GO
+
+ALTER TABLE dbo.Employee ADD
+    CONSTRAINT FK_Employee_Department   FOREIGN KEY (DepartmentId) REFERENCES dbo.Department (DepartmentId),
+    CONSTRAINT FK_Employee_Manager      FOREIGN KEY (ManagerId)    REFERENCES dbo.Employee (EmployeeId),
+    CONSTRAINT FK_Employee_CreatedBy    FOREIGN KEY (CreatedById)  REFERENCES dbo.Employee (EmployeeId),
+    CONSTRAINT FK_Employee_ModifiedBy   FOREIGN KEY (ModifiedById) REFERENCES dbo.Employee (EmployeeId);
+GO
+
+ALTER TABLE dbo.AppUser ADD
+    CONSTRAINT FK_AppUser_Employee      FOREIGN KEY (EmployeeId) REFERENCES dbo.Employee (EmployeeId);
+GO
+
+ALTER TABLE dbo.UserRole ADD
+    CONSTRAINT FK_UserRole_User         FOREIGN KEY (UserId) REFERENCES dbo.AppUser (UserId),
+    CONSTRAINT FK_UserRole_Role         FOREIGN KEY (RoleId) REFERENCES dbo.Role (RoleId);
+GO
+
+ALTER TABLE dbo.LeaveRequest ADD
+    CONSTRAINT FK_LeaveRequest_Employee    FOREIGN KEY (EmployeeId)    REFERENCES dbo.Employee (EmployeeId),
+    CONSTRAINT FK_LeaveRequest_LeaveType   FOREIGN KEY (LeaveTypeId)   REFERENCES dbo.LeaveType (LeaveTypeId),
+    CONSTRAINT FK_LeaveRequest_SubmittedBy FOREIGN KEY (SubmittedById) REFERENCES dbo.Employee (EmployeeId),
+    CONSTRAINT FK_LeaveRequest_DecidedBy   FOREIGN KEY (DecidedById)   REFERENCES dbo.Employee (EmployeeId),
+    CONSTRAINT FK_LeaveRequest_CancelledBy FOREIGN KEY (CancelledById) REFERENCES dbo.Employee (EmployeeId);
+GO
+
+ALTER TABLE dbo.LeaveTransaction ADD
+    CONSTRAINT FK_LeaveTxn_Employee     FOREIGN KEY (EmployeeId)     REFERENCES dbo.Employee (EmployeeId),
+    CONSTRAINT FK_LeaveTxn_LeaveType    FOREIGN KEY (LeaveTypeId)    REFERENCES dbo.LeaveType (LeaveTypeId),
+    CONSTRAINT FK_LeaveTxn_LeaveRequest FOREIGN KEY (LeaveRequestId) REFERENCES dbo.LeaveRequest (RequestId),
+    CONSTRAINT FK_LeaveTxn_CreatedBy    FOREIGN KEY (CreatedById)    REFERENCES dbo.Employee (EmployeeId);
+GO
+
+
+/* =============================================================================
+   SECTION 4 - INDEXES
+   ============================================================================= */
+
+/* THE IMPORTANT ONE.
+   Stops the yearly allocation job creating a second allocation if it runs twice.
+   Filtered, because deductions obviously repeat - only the once-per-year rows
+   are constrained. Without this, a re-run silently doubles everyone's leave. */
+CREATE UNIQUE NONCLUSTERED INDEX UX_LeaveTxn_OneGrantPerYear
+    ON dbo.LeaveTransaction (EmployeeId, LeaveTypeId, LeaveYear, TransactionType)
+    WHERE TransactionType IN ('ALLOCATION','CARRY_FORWARD');
+GO
+
+/* Covers the balance query: SUM(Hours) for one employee / type / year. */
+CREATE NONCLUSTERED INDEX IX_LeaveTxn_Balance
+    ON dbo.LeaveTransaction (EmployeeId, LeaveTypeId, LeaveYear)
+    INCLUDE (Hours, TransactionType, EffectiveEnd);
+GO
+
+/* Covers the pending-hours query. */
+CREATE NONCLUSTERED INDEX IX_LeaveRequest_Pending
+    ON dbo.LeaveRequest (EmployeeId, LeaveTypeId, LeaveYear, Status)
+    INCLUDE (Hours);
+GO
+
+/* "Show me requests waiting for my decision" - the manager's inbox. */
+CREATE NONCLUSTERED INDEX IX_LeaveRequest_Status_Dates
+    ON dbo.LeaveRequest (Status, StartDate)
+    INCLUDE (EmployeeId, LeaveTypeId, Hours);
+GO
+
+/* "Who is off next Tuesday" - overlapping date range scan. */
+CREATE NONCLUSTERED INDEX IX_LeaveRequest_DateRange
+    ON dbo.LeaveRequest (StartDate, EndDate)
+    INCLUDE (EmployeeId, Status);
+GO
+
+CREATE NONCLUSTERED INDEX IX_Employee_Manager    ON dbo.Employee (ManagerId);
+CREATE NONCLUSTERED INDEX IX_Employee_Department ON dbo.Employee (DepartmentId);
+GO
+
+
+/* =============================================================================
+   SECTION 5 - BALANCE VIEW
+
+   This replaces the EmployeeLeaveBalance table. It is calculated, so it can
+   never disagree with the transactions behind it.
+
+   AvailableHours already subtracts pending requests, so it is the number to
+   show an employee and to validate a new request against. Without that
+   subtraction someone with 8 hours left could submit two 8-hour requests while
+   the first is still awaiting approval.
+   ============================================================================= */
+GO
+CREATE VIEW dbo.vw_EmployeeLeaveBalance
+AS
+SELECT
+    e.EmployeeId,
+    lt.LeaveTypeId,
+    t.LeaveYear,
+
+    -- Everything granted: allocation, accrual, carry-forward, positive adjustments
+    SUM(CASE WHEN t.Hours > 0 THEN t.Hours ELSE 0 END)           AS GrantedHours,
+
+    -- Everything consumed, as a positive number for display
+    SUM(CASE WHEN t.Hours < 0 THEN -t.Hours ELSE 0 END)          AS UsedHours,
+
+    -- The ledger balance
+    SUM(t.Hours)                                                 AS RemainingHours,
+
+    -- Submitted but not yet decided
+    ISNULL((
+        SELECT SUM(r.Hours)
+        FROM dbo.LeaveRequest r
+        WHERE r.EmployeeId  = e.EmployeeId
+          AND r.LeaveTypeId = lt.LeaveTypeId
+          AND r.LeaveYear   = t.LeaveYear
+          AND r.Status      = 'Pending'
+    ), 0)                                                        AS PendingHours,
+
+    -- What the employee can actually book right now
+    SUM(t.Hours) - ISNULL((
+        SELECT SUM(r.Hours)
+        FROM dbo.LeaveRequest r
+        WHERE r.EmployeeId  = e.EmployeeId
+          AND r.LeaveTypeId = lt.LeaveTypeId
+          AND r.LeaveYear   = t.LeaveYear
+          AND r.Status      = 'Pending'
+    ), 0)                                                        AS AvailableHours
+
+FROM dbo.LeaveTransaction t
+JOIN dbo.Employee  e  ON e.EmployeeId  = t.EmployeeId
+JOIN dbo.LeaveType lt ON lt.LeaveTypeId = t.LeaveTypeId
+GROUP BY e.EmployeeId, lt.LeaveTypeId, t.LeaveYear;
+GO
+
+
+/* =============================================================================
+   SECTION 6 - REFERENCE DATA
+
+   Leave types, roles and holidays are configuration, not schema. Keeping them
+   here as re-runnable inserts means you can reset a dev database easily.
+   ============================================================================= */
+
+INSERT INTO dbo.Role (Name, Description)
+SELECT v.Name, v.Descr
+FROM (VALUES
+    ('Employee', 'Can view own balance and submit requests'),
+    ('Manager',  'Can approve or reject requests from direct reports'),
+    ('HR',       'Can adjust balances and manage leave types'),
+    ('Admin',    'Full system access')
+) v(Name, Descr)
+WHERE NOT EXISTS (SELECT 1 FROM dbo.Role r WHERE r.Name = v.Name);
+GO
+
+INSERT INTO dbo.LeaveType (Code, TypeName, Description, DefaultAnnualHours)
+SELECT v.Code, v.TypeName, v.Descr, v.Hrs
+FROM (VALUES
+    ('ANNUAL',    'Annual Leave',    'Paid time off',                  160.00),
+    ('SICK',      'Sick Leave',      'Illness or medical appointment',  80.00),
+    ('CASUAL',    'Casual Leave',    'Short-notice personal leave',     40.00),
+    ('UNPAID',    'Unpaid Leave',    'Leave without pay',                0.00)
+) v(Code, TypeName, Descr, Hrs)
+WHERE NOT EXISTS (SELECT 1 FROM dbo.LeaveType t WHERE t.Code = v.Code);
+GO
+
+
+/* =============================================================================
+   SECTION 7 - WORKED EXAMPLE  (delete before production)
+
+   Shows the three operations your API performs, in the right order, with the
+   transaction boundaries that keep the ledger honest.
+   ============================================================================= */
+
+/* --- 7a. Yearly allocation. Run once per employee per leave type. ------------
+INSERT INTO dbo.LeaveTransaction
+    (EmployeeId, LeaveTypeId, LeaveYear, TransactionType, Hours,
+     EffectiveStart, EffectiveEnd, CreatedById)
+SELECT
+    e.EmployeeId, lt.LeaveTypeId, 2026, 'ALLOCATION', lt.DefaultAnnualHours,
+    '2026-01-01', '2026-12-31', NULL
+FROM dbo.Employee e
+CROSS JOIN dbo.LeaveType lt
+WHERE e.IsActive = 1
+  AND lt.IsActive = 1
+  AND lt.DefaultAnnualHours > 0
+  AND NOT EXISTS (                      -- makes the job safe to re-run
+      SELECT 1 FROM dbo.LeaveTransaction t
+      WHERE t.EmployeeId  = e.EmployeeId
+        AND t.LeaveTypeId = lt.LeaveTypeId
+        AND t.LeaveYear   = 2026
+        AND t.TransactionType = 'ALLOCATION'
+  );
+*/
+
+/* --- 7b. Approving a request --------------------------------------------------
+   Both statements in ONE transaction. If the ledger insert fails, the status
+   change must roll back too, or you get approved leave that was never deducted.
+
+BEGIN TRANSACTION;
+
+    UPDATE dbo.LeaveRequest
+    SET Status = 'Approved', DecisionDate = SYSUTCDATETIME(), DecidedById = @ManagerId
+    WHERE RequestId = @RequestId AND Status = 'Pending';   -- guards against double approval
+
+    IF @@ROWCOUNT = 1
+        INSERT INTO dbo.LeaveTransaction
+            (EmployeeId, LeaveTypeId, LeaveYear, TransactionType, Hours, LeaveRequestId, CreatedById)
+        SELECT EmployeeId, LeaveTypeId, LeaveYear, 'DEDUCTION', -Hours, RequestId, @ManagerId
+        FROM dbo.LeaveRequest WHERE RequestId = @RequestId;
+    ELSE
+        THROW 50001, 'Request was not pending.', 1;
+
+COMMIT;
+*/
+
+/* --- 7c. Cancelling approved leave -------------------------------------------
+   Note the REVERSAL row. The original -8 is never edited or deleted.
+
+BEGIN TRANSACTION;
+
+    UPDATE dbo.LeaveRequest
+    SET Status = 'Cancelled', CancelledOn = SYSUTCDATETIME(), CancelledById = @EmployeeId
+    WHERE RequestId = @RequestId AND Status = 'Approved';
+
+    IF @@ROWCOUNT = 1
+        INSERT INTO dbo.LeaveTransaction
+            (EmployeeId, LeaveTypeId, LeaveYear, TransactionType, Hours, LeaveRequestId, CreatedById)
+        SELECT EmployeeId, LeaveTypeId, LeaveYear, 'REVERSAL', Hours, RequestId, @EmployeeId
+        FROM dbo.LeaveRequest WHERE RequestId = @RequestId;
+
+COMMIT;
+*/
+
+/* --- 7d. Reading a balance ----------------------------------------------------
+SELECT * FROM dbo.vw_EmployeeLeaveBalance
+WHERE EmployeeId = 1 AND LeaveYear = 2026;
+*/
+
+/* --- 7e. Explaining a balance to someone who disputes it ----------------------
+SELECT TransactionDate, TransactionType, Hours, Reason, LeaveRequestId
+FROM dbo.LeaveTransaction
+WHERE EmployeeId = 1 AND LeaveTypeId = 1 AND LeaveYear = 2026
+ORDER BY TransactionDate;
+*/

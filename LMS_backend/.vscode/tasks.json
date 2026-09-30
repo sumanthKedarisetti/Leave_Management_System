@@ -1,0 +1,21 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "sqlproj: Build LMS_Database",
+			"type": "process",
+			"command": "dotnet",
+			"args": [
+				"build",
+				"/Users/sai/Desktop/Leave_Management_System/LMS_backend/LMS_Database/LMS_Database.sqlproj"
+			],
+			"problemMatcher": "$sqlproj-problem-matcher",
+			"isBackground": true,
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"detail": "Builds the LMS_Database SQL project"
+		}
+	]
+}

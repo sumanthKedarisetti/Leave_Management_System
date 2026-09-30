@@ -1,0 +1,5 @@
+{
+    "dataworkspace.excludedProjects": [
+        "LMS_Database/LMS_Database.sqlproj"
+    ]
+}
